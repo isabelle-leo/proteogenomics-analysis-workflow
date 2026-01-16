@@ -374,6 +374,149 @@ process msgfPlus {
   """
 }
 
+<<<<<<< Updated upstream
+=======
+process fragPipeSearch {
+
+  when: search_engine == 'fragpipe'
+  
+  conda "/home/il364/.conda/envs/fragpipe"
+
+  input:
+  set val(setfr_id), path(db), val(setname), val(sample), path(mzml) from mzml_fragpipe
+  path mods
+  
+  output:
+  set val(setname), val(sample), file("${sample}.pepXML") into pepxml_files
+  
+  script:
+  """
+  # Parse MSGF+ mods file to MSFragger format
+  parse_msgf_mods_to_fragger.py $mods fragger_mods.txt
+  
+  # Create MSFragger parameter file
+  cat > fragger.params <<EOF
+database_name = $db
+decoy_prefix = decoy_
+keep_decoys = 0
+precursor_mass_lower = -15
+precursor_mass_upper = 15
+precursor_mass_units = 1
+precursor_true_tolerance = 20
+precursor_true_units = 1
+fragment_mass_tolerance = 20
+fragment_mass_units = 1
+isotope_error = -1/0/1/2
+calibrate_mass = 2
+search_enzyme_name = nonspecific
+num_enzyme_termini = 2
+allowed_missed_cleavage_1 = ${params.maxmiscleav}
+search_enzyme_sense_1 = C
+search_enzyme_cut_1 = @
+allowed_missed_cleavage_1 = 2
+search_enzyme_sense_2 = C
+search_enzyme_cut_2 = @
+clip_nTerm_M = 1
+digest_min_length = ${params.minlen}
+digest_max_length = ${params.maxlen}
+digest_mass_range_low = 300.0
+digest_mass_range_high = 5000.0
+precursor_charge = 2 4
+\$(cat fragger_mods.txt)
+ms_level = 2
+activation_types = ALL
+output_format = pepXML
+output_report_topN = 1
+output_max_expect = 50
+num_threads = ${task.cpus * params.threadspercore}
+fragment_ion_series = b,y
+write_calibrated_mzml = 0
+EOF
+
+  # Run MSFragger with Java 17
+  java -Xmx${task.memory.toMega()}M -jar ${params.msfragger_jar} fragger.params $mzml
+  
+  # Rename output
+  BASENAME=\$(basename $mzml .mzML)
+  mv \${BASENAME}.pepXML ${sample}.pepXML
+  """
+}
+
+process convertPepXMLToMzid {
+
+  when: search_engine == 'fragpipe'
+  
+  conda "/home/il364/.conda/envs/proteogenomics"
+
+  input:
+  set val(setname), val(sample), path(pepxml) from pepxml_files
+  
+  output:
+  set val(setname), val(sample), file("${sample}.mzid") into mzid_files
+  
+  script:
+  """
+  # Convert pepXML to mzIdentML using OpenMS
+  IDFileConverter -in $pepxml -out ${sample}.mzid
+  
+  # Verify decoy labels
+  DECOY_COUNT=\$(grep -c 'accession="decoy_' ${sample}.mzid || echo 0)
+  if [ "\$DECOY_COUNT" -eq 0 ]; then
+    echo "ERROR: No decoy sequences found in mzID file!"
+    exit 1
+  fi
+  echo "Found \$DECOY_COUNT decoy entries in mzID - OK"
+  """
+}
+
+// Split mzid_files: one copy for mzids_fragpipe channel, one for TSV conversion
+mzid_files
+  .tap { mzids_fragpipe }
+  .set { mzid_files_for_tsv }
+
+process convertMzidToTSV {
+
+  when: search_engine == 'fragpipe'
+  
+  conda "/home/il364/.conda/envs/proteogenomics"
+
+  input:
+  set val(setname), val(sample), path(mzid) from mzid_files_for_tsv
+  
+  output:
+  set val(setname), file(mzid), file('out.mzid.tsv') into mzidtsvs_fragpipe
+  
+  script:
+  """
+  # Convert to TSV using msgf_plus
+  msgf_plus -Xmx${task.memory.toMega()}M edu.ucsd.msjava.ui.MzIDToTsv -i "$mzid" -o out.mzid.tsv
+  
+  # Final check
+  TSV_DECOY_COUNT=\$(grep -c 'decoy_' out.mzid.tsv || echo 0)
+  if [ "\$TSV_DECOY_COUNT" -eq 0 ]; then
+    echo "ERROR: No decoy sequences found in TSV!"
+    exit 1
+  fi
+  echo "Found \$TSV_DECOY_COUNT decoy entries in TSV - OK"
+  
+  # Cleanup
+  rm -f \${BASENAME}.pepXML fragger.params fragger_mods.txt
+  """
+}
+
+// Combine outputs from both search engines
+// Note: When a process doesn't run due to `when`, its output channels exist but are empty.
+// The tap above ensures mzids_fragpipe is defined from mzid_files.
+// mzids_msgf/mzidtsvs_msgf come from msgfPlus, mzidtsvs_fragpipe comes from convertMzidToTSV.
+
+mzids_msgf.mix(mzids_fragpipe).set { mzids }
+mzidtsvs_msgf.mix(mzidtsvs_fragpipe).set { mzidtsvs }
+
+// ============================================================================
+// END SEARCH ENGINE PROCESSES
+// ============================================================================
+
+>>>>>>> Stashed changes
 mzids
   .groupTuple()
   .set { mzids_2pin }
