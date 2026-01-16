@@ -375,7 +375,10 @@ process msgfPlus {
 }
 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 =======
+=======
+>>>>>>> Stashed changes
 process fragPipeSearch {
 
   when: search_engine == 'fragpipe'
