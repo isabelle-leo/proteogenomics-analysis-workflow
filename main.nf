@@ -31,69 +31,97 @@ cosmic = params.cosmic ? file(params.cosmic) : false
 genomefa = file(params.genome)
 tdb = file(params.tdb)
 normalpsms = params.normalpsms ? file(params.normalpsms) : false
+timstof = params.timstof ?: false
+file_extension = params.input_format == 'timstof_d' ? '*.d' : '*.mzML'
 
-
+// Search engine selection (default: msgf)
+search_engine = params.search_engine ?: 'msgf'
+if (!(search_engine in ['msgf', 'fragpipe'])) {
+  println("Invalid search_engine: ${search_engine}. Must be 'msgf' or 'fragpipe'")
+  exit(1)
+}
 
 /* PIPELINE START */
 
-// Either feed an mzmldef file (tab separated lines with filepath\tsetname), or /path/to/\*.mzML
+// Either feed an mzmldef file (tab separated lines with filepath\tsetname), or /path/to/files
 if (!params.mzmldef && !params.input) {
   Channel
     .fromPath(params.mzmls)
-    .map { it -> [it, 'NA'] }
-    .set { mzml_in }
+    .map { it -> [it, 'NA', 'NA', 'NA'] }
+    .set { mzml_raw }
 } else {
   header = ['mzmlfile', 'setname', 'plate', 'fraction']
   mzmldef = params.mzmldef ?: params.input
   mzmllines = file(mzmldef).readLines().collect { it.tokenize('\t') }
   if (mzmllines[0] == header) {
-    /* As above, future use with pushing files with a header becomes enabled, as long as
-    they use this header format. We cannot do module importing etc yet, have to use DSL2
-    for that. That is something to strive for in the future.
-    */
     mzmllines.remove(0)
   }
   Channel
     .from(mzmllines)
-    .set { mzml_in }
+    .map { it -> [file(it[0]), it[1], it[2] ? it[2] : 'NA', it[3] ? it[3].toInteger() : 'NA' ]}
+    .set { mzml_raw }
 }
 
 
-// Isobaric input parsing to setisobaric and setdenoms maps
-// example: --isobaric 'set1:tmt10plex:127N:128N set2:tmtpro:sweep set3:itraq8plex:intensity'
-isop = params.isobaric ? params.isobaric.tokenize(' ') : false
-setisobaric = isop ? isop.collect() {
-  y -> y.tokenize(':')
-}.collectEntries() {
-  x-> [x[0], x[1]]
-} : false
-// FIXME add non-isobaric sets here if we have any mixed-in?
-setdenoms = isop ? isop.collect() {
-  y -> y.tokenize(':')
-}.collectEntries() {
-  x-> [x[0], x[2..-1]]
-} : false
+// Split input based on search engine
+if (search_engine == 'msgf') {
+  mzml_raw.set { mzml_to_filter }
+  Channel.empty().set { mzml_to_passthrough }
+} else {
+  Channel.empty().set { mzml_to_filter }
+  mzml_raw.set { mzml_to_passthrough }
+}
 
+process filterMzML {
+  
+  tag "${mzmlfile.baseName}"
+  
+  input:
+  set file(mzmlfile), val(setname), val(plate), val(fraction) from mzml_to_filter
+  
+  output:
+  set file("${mzmlfile.baseName}_filtered.mzML"), val(setname), val(plate), val(fraction) into mzml_filtered
+  
+  script:
+  """
+  ${workflow.projectDir}/bin/extract_spectra.py $mzmlfile ${mzmlfile.baseName}_filtered.mzML 10000000
+  """
+}
 
-mzml_in
+process passThroughRaw {
+  
+  tag "${infile.baseName}"
+  
+  input:
+  set file(infile), val(setname), val(plate), val(fraction) from mzml_to_passthrough
+  
+  output:
+  set file(infile), val(setname), val(plate), val(fraction) into mzml_passthrough
+  
+  script:
+  """
+  echo "Passing through ${infile.baseName} for FragPipe"
+  """
+}
+
+// Merge
+mzml_filtered
+  .mix(mzml_passthrough)
   .tap { sets; mzmlcounter }
-  .map { it -> [file(it[0]), it[1], it[2] ? it[2] : 'NA', it[3] ? it[3].toInteger() : 'NA' ]} // create file, set plate and fraction to NA if there is none
   .tap { strips }
-  .map { it -> [it[1], it[0].baseName.replaceFirst(/.*\/(\S+)\.mzML/, "\$1"), it[0], it[2], it[3]] }
-  .into { mzmlfiles; groupset_mzmls; mzml_isobaric; mzml_premsgf }
+  .map { it -> [it[1], it[0].baseName.replaceFirst(/_filtered$/, ""), it[0], it[2], it[3]] }
+  .into { mzmlfiles; groupset_mzmls; mzml_isobaric; mzml_presearch }
 
 mzmlcounter
   .count()
-  .subscribe { println "$it mzML files in analysis" }
+  .subscribe { println "$it files in analysis" }
   .set { mzmlcount_psm }
-
 sets
   .map{ it -> it[1] }
   .unique()
   .tap { sets_for_emtpybam; sets_for_denoms; sets_for_six }
   .collect()
   .subscribe { println "Detected setnames: ${it.join(', ')}" }
-
 
 strips
   .map { it -> [it[1], it[2]] }
@@ -190,12 +218,12 @@ if (params.pisepdb) {
     .transpose()
     .map { it -> ["${it[0]}_${it[1]}_${it[2].baseName.replaceFirst(/.*_fr[0]*/, "")}", it[2]]}
     .set { db_w_id }
-  mzml_premsgf
+  mzml_presearch
     .map { it -> ["${it[0]}_${it[3]}_${it[4]}", it[0], it[1], it[2]] }  // add set_strip_fr identifier
     .into { mzml_dbid; mzml_dbfilter }
 } else {
   Channel.from([['NA', tdb]]).set { db_w_id }
-  mzml_premsgf
+  mzml_presearch
     .map { it -> ["NA", it[0], it[1], it[2]] }
     .into { mzml_dbid; mzml_dbfilter }
 }
@@ -233,7 +261,6 @@ db_w_id
   .set { db_filtered }
 
 process concatFasta {
- 
   input:
   set val(dbid), file(db), file(targetlookup), file('decoy_known.fa') from db_filtered
   file knownproteins
@@ -245,10 +272,24 @@ process concatFasta {
   """
   # copy DB for faster access on network FS
   cp ${targetlookup} localdb.sql
-  cat $db $knownproteins > td_concat.fa
+  
+  # Generate decoys from VarDB
   msstitch makedecoy -i $db --dbfile localdb.sql -o decoy_db.fa --scramble tryp_rev --minlen $params.minlen ${params.pisepdb ? '--notrypsin': ''}
-  cat decoy_db.fa decoy_known.fa >> td_concat.fa
-  rm decoy_db.fa localdb.sql
+  
+  # Combine everything into one file
+  cat $db $knownproteins decoy_db.fa decoy_known.fa > td_concat_all.fa
+  
+  # Deduplicate by ID (keep first occurrence) - applied to EVERYTHING
+  awk '/^>/ {id=\$1; if (!seen[id]++) {keep=1; print} else {keep=0}} !/^>/ {if (keep) print}' \
+    td_concat_all.fa > td_concat.fa
+  
+  # Report deduplication stats
+  BEFORE=\$(grep -c "^>" td_concat_all.fa)
+  AFTER=\$(grep -c "^>" td_concat.fa)
+  echo "Deduplication: \$BEFORE -> \$AFTER sequences (removed \$((BEFORE - AFTER)) duplicates)"
+  
+  # Cleanup
+  rm decoy_db.fa localdb.sql td_concat_all.fa
   """
 }
 
@@ -257,13 +298,13 @@ process concatFasta {
 db_concatdecoy
   .cross(mzml_dbid) // gives two Arrays so unfold them in next map step
   .map { it -> [it[0][0], it[0][1], it[1][1], it[1][2], it[1][3]] } // dbid, db, set, sample, file
-  .set { mzml_msgf }
+  .set { mzml_search }
 
 process prepareFilterDB {
 
   input:
-  file(knownproteins)
-  file(snpfa)
+  path knownproteins
+  path snpfa
 
   output:
   file('knownprot.sqlite') into protseqdb
@@ -271,9 +312,9 @@ process prepareFilterDB {
   file('mslookup_db.sqlite') into trypseqdb
 
   """
-  msstitch storeseq -i $knownproteins --minlen $params.minlen --fullprotein --minlen 7 -o knownprot.sqlite
-  msstitch storeseq -i $snpfa --minlen $params.minlen -o snpprot.sqlite --fullprotein --minlen 7
-  msstitch storeseq -i $knownproteins --insourcefrag --minlen $params.minlen
+  msstitch storeseq -i $knownproteins --minlen ${params.minlen} --fullprotein --minlen 7 -o knownprot.sqlite
+  msstitch storeseq -i $snpfa --minlen ${params.minlen} -o snpprot.sqlite --fullprotein --minlen 7
+  msstitch storeseq -i $knownproteins --insourcefrag --minlen ${params.minlen}
   """
 }
 
@@ -295,7 +336,7 @@ process IsobaricQuant {
   plextype = isobtype ? isobtype.replaceFirst(/[0-9]+plex/, "") : 'false'
   massshift = [tmt:0.0013, itraq:0.00125, false:0][plextype]
   """
-  IsobaricAnalyzer  -type $isobtype -in $infile -out "${infile}.consensusXML" -extraction:select_activation "$activationtype" -extraction:reporter_mass_shift $massshift -extraction:min_precursor_intensity 1.0 -extraction:keep_unannotated_precursor true -quantification:isotope_correction true 
+  IsobaricAnalyzer  -type $isobtype -in $infile -out "${infile}.consensusXML" -extraction:select_activation "$activationtype" -extraction:reporter_mass_shift $massshift -extraction:min_precursor_intensity 1.0 -extraction:keep_unannotated_precursor true -quantification:isotope_correction true -t 10ppm -ti 0,1 
   """
 }
 
@@ -351,34 +392,39 @@ if (!params.quantlookup) {
 } 
 
 
+// ============================================================================
+// SEARCH ENGINE PROCESSES
+// ============================================================================
+
+if (search_engine == 'msgf') {
+  mzml_search.set { mzml_msgf }
+  Channel.empty().set { mzml_fragpipe }
+} else {
+  mzml_search.set { mzml_fragpipe }
+  Channel.empty().set { mzml_msgf }
+}
+
 process msgfPlus {
 
-  // Some versions have problems when converting to TSV, possible too long identifiers 
-  // If problems arise, try to use an older version: msgf_plus:2016.10.26--py27_1
+  when: search_engine == 'msgf'
 
   input:
   set val(setfr_id), file(db), val(setname), val(sample), file(mzml) from mzml_msgf
   file mods
-
+  
   output:
-  set val(setname), val(sample), file("${sample}.mzid") into mzids
-  set val(setname), file("${sample}.mzid"), file('out.mzid.tsv') into mzidtsvs
+  set val(setname), val(sample), file("${sample}.mzid") into mzids_msgf
+  set val(setname), file("${sample}.mzid"), file('out.mzid.tsv') into mzidtsvs_msgf
   
   script:
-  mem = db.size() * 16 // used in conf profile
   msgfprotocol = 0
   """
-  msgf_plus -Xmx${task.memory.toMega()}M -d $db -s $mzml -o "${sample}.mzid" -thread ${task.cpus * params.threadspercore} -mod $mods -maxMissedCleavages ${params.maxmiscleav} -tda 0 -t 10.0ppm -ti -1,2 -m 0 -inst 3 -e 1 -protocol ${msgfprotocol} -ntt 2 -minLength $params.minlen -maxLength $params.maxlen -minCharge 2 -maxCharge 6 -n 1 -addFeatures 1
-  msgf_plus -Xmx3500M edu.ucsd.msjava.ui.MzIDToTsv -i "${sample}.mzid" -o out.mzid.tsv
-  rm td_concat.c*
+  msgf_plus -Xmx${task.memory.toMega()}M -d $db -s $mzml -o "${sample}.mzid" -thread ${task.cpus * params.threadspercore} -mod $mods -tda 0 -t 15ppm -ti -1,2 -m 0 -inst 3 -e 0 -protocol ${msgfprotocol} -ntt 2 -minLength 8 -maxLength 15 -minCharge 2 -maxCharge 4 -n 1 -addFeatures 1
+  msgf_plus -Xmx${task.memory.toMega()}M edu.ucsd.msjava.ui.MzIDToTsv -i "${sample}.mzid" -o out.mzid.tsv
+  rm -f td_concat.c*
   """
 }
 
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-=======
-=======
->>>>>>> Stashed changes
 process fragPipeSearch {
 
   when: search_engine == 'fragpipe'
@@ -416,7 +462,6 @@ num_enzyme_termini = 2
 allowed_missed_cleavage_1 = ${params.maxmiscleav}
 search_enzyme_sense_1 = C
 search_enzyme_cut_1 = @
-allowed_missed_cleavage_1 = 2
 search_enzyme_sense_2 = C
 search_enzyme_cut_2 = @
 clip_nTerm_M = 1
@@ -439,9 +484,11 @@ EOF
   # Run MSFragger with Java 17
   java -Xmx${task.memory.toMega()}M -jar ${params.msfragger_jar} fragger.params $mzml
   
-  # Rename output
+  # Rename output if needed
   BASENAME=\$(basename $mzml .mzML)
-  mv \${BASENAME}.pepXML ${sample}.pepXML
+  if [ "\${BASENAME}.pepXML" != "${sample}.pepXML" ]; then
+    mv \${BASENAME}.pepXML ${sample}.pepXML
+  fi
   """
 }
 
@@ -519,27 +566,23 @@ mzidtsvs_msgf.mix(mzidtsvs_fragpipe).set { mzidtsvs }
 // END SEARCH ENGINE PROCESSES
 // ============================================================================
 
->>>>>>> Stashed changes
 mzids
   .groupTuple()
   .set { mzids_2pin }
 
 
 process percolator {
-
   input:
   set val(setname), val(samples), file('mzid?') from mzids_2pin
-
   output:
   set val(setname), file('perco.xml') into percolated
-
   script:
   mzmlcount = samples.size() 
   """
   mkdir mzids
   count=1;for sam in ${samples.join(' ')}; do ln -s `pwd`/mzid\$count mzids/\${sam}.mzid; echo mzids/\${sam}.mzid >> metafile; ((count++));done
-  msgf2pin -o percoin.xml -e trypsin -P "decoy_" metafile
-  percolator -j percoin.xml -X perco.xml -N 500000 --decoy-xml-output -y
+  msgf2pin -o percoin.xml -P "decoy_" metafile
+  percolator -j percoin.xml -X perco.xml -N 500000 --decoy-xml-output -y --subset-max-train 300000
   """
 }
 
@@ -606,8 +649,7 @@ process filterPercolator {
   """
   else
   """
-  msstitch filterperco -i $perco -o filtseq --dbfile trypseqdb --insourcefrag 2 --deamidate 
-  msstitch filterperco -i filtseq -o filtprot --fullprotein --dbfile protseqdb --minlen $params.minlen --deamidate
+  msstitch filterperco -i $perco -o filtprot --fullprotein --dbfile protseqdb --minlen $params.minlen --deamidate
   """
 }
 
@@ -626,14 +668,24 @@ variantmzidtsv
   .join(var_filtered_perco)
   .concat(nov_mzperco)
   .set { allmzperco }
+  
+if (params.timstof) {
+  allmzperco.set { allmzperco_timstof }
+  Channel.empty().set { allmzperco_standard }
+} else {
+  allmzperco.set { allmzperco_standard }
+  Channel.empty().set { allmzperco_timstof }
+}
 
 process svmToTSV {
 
+  when: !params.timstof
+
   input:
-  set val(setname), file('mzid?'), file('tsv?'), val(peptype), file(perco) from allmzperco 
+  set val(setname), file('mzid?'), file('tsv?'), val(peptype), file(perco) from allmzperco_standard
 
   output:
-  set val(setname), val(peptype), file('target.tsv') into mzidtsv_perco
+  set val(setname), val(peptype), file('target.tsv') into mzidtsv_perco_standard
 
   script:
   """
@@ -651,6 +703,138 @@ process svmToTSV {
   msstitch split -i psms --splitcol TD
   """
 }
+
+process svmToTSV_timsTOF {
+
+  when: params.timstof
+
+  input:
+  set val(setname), file('mzid?'), file('tsv?'), val(peptype), file(perco) from allmzperco_timstof
+
+  output:
+  set val(setname), val(peptype), file('target.tsv') into mzidtsv_perco_timstof
+
+  script:
+  """
+  #!/usr/bin/env python3
+  import xml.etree.ElementTree as ET
+  import glob
+  import csv
+  import re
+
+  # Parse percolator XML to get PSM info
+  perco_psms = {}
+  tree = ET.parse('${perco}')
+  root = tree.getroot()
+  ns = {'p': 'http://per-colator.com/percolator_out/15'}
+  
+  for psm in root.findall('.//p:psm', ns):
+      psm_id = psm.get('{http://per-colator.com/percolator_out/15}psm_id')
+      decoy = psm.get('{http://per-colator.com/percolator_out/15}decoy')
+      if decoy == 'true':
+          continue
+      
+      q_value = psm.find('p:q_value', ns).text
+      pep = psm.find('p:pep', ns).text
+      svm_score = psm.find('p:svm_score', ns).text
+      peptide_elem = psm.find('p:peptide_seq', ns)
+      peptide = peptide_elem.get('seq')
+      
+      # Extract filename and scan info from PSM ID
+      # Format: filename_SII_specidx_rank_scannum_charge_1
+      parts = psm_id.rsplit('_SII_', 1)
+      if len(parts) == 2:
+          filename = parts[0]
+          scan_parts = parts[1].split('_')
+          if len(scan_parts) >= 4:
+              spec_idx = scan_parts[0]
+              scan_num = scan_parts[2]
+              charge = scan_parts[3]
+              key = (filename, peptide, charge)
+              perco_psms[key] = {
+                  'q_value': q_value,
+                  'pep': pep,
+                  'svm_score': svm_score,
+                  'psm_id': psm_id
+              }
+
+  # Read all TSV files and match
+  tsv_files = sorted(glob.glob('tsv*'))
+  mzid_files = sorted(glob.glob('mzid*'))
+  
+  # Build mzid mapping: spectrumID -> native ID
+  mzid_mapping = {}
+  for mzid_file in mzid_files:
+      tree = ET.parse(mzid_file)
+      root = tree.getroot()
+      mzid_ns = {'mzid': 'http://psidev.info/psi/pi/mzIdentML/1.1'}
+      
+      # Get filename from mzid
+      for spec_data in root.findall('.//mzid:SpectraData', mzid_ns):
+          location = spec_data.get('location', '')
+          mzid_filename = location.split('/')[-1].replace('.mzML', '').replace('_filtered', '')
+          
+      for spec_result in root.findall('.//mzid:SpectrumIdentificationResult', mzid_ns):
+          spec_id = spec_result.get('spectrumID')
+          for spec_item in spec_result.findall('mzid:SpectrumIdentificationItem', mzid_ns):
+              charge = spec_item.get('chargeState')
+              peptide_ref = spec_item.get('peptide_ref')
+              # Get peptide sequence
+              for pep_elem in root.findall(f".//mzid:Peptide[@id='{peptide_ref}']", mzid_ns):
+                  pep_seq = pep_elem.find('mzid:PeptideSequence', mzid_ns)
+                  if pep_seq is not None:
+                      seq = pep_seq.text
+                      key = (mzid_filename, seq, charge)
+                      mzid_mapping[key] = spec_id
+
+  # Process TSV files
+  all_rows = []
+  header = None
+  
+  for tsv_file in tsv_files:
+      with open(tsv_file, 'r') as f:
+          reader = csv.DictReader(f, delimiter='\\t')
+          if header is None:
+              header = reader.fieldnames + ['percolator svm-score', 'PSM q-value', 'PSM PEP', 'peptide q-value', 'peptide PEP', 'TD']
+          
+          for row in reader:
+              # Extract info for matching
+              spec_file = row.get('#SpecFile', row.get('SpecFile', ''))
+              filename = spec_file.split('/')[-1].replace('.mzML', '').replace('_filtered', '')
+              peptide = row.get('Peptide', '')
+              charge = row.get('Charge', '')
+              
+              key = (filename, peptide, charge)
+              
+              if key in perco_psms:
+                  perco_data = perco_psms[key]
+                  row['percolator svm-score'] = perco_data['svm_score']
+                  row['PSM q-value'] = perco_data['q_value']
+                  row['PSM PEP'] = perco_data['pep']
+                  row['peptide q-value'] = perco_data['q_value']  # Same as PSM for now
+                  row['peptide PEP'] = perco_data['pep']
+                  row['TD'] = 'target'
+                  all_rows.append(row)
+
+  # Write output
+  if all_rows:
+      with open('target.tsv', 'w', newline='') as f:
+          writer = csv.DictWriter(f, fieldnames=header, delimiter='\\t', extrasaction='ignore')
+          writer.writeheader()
+          writer.writerows(all_rows)
+  else:
+      # Write empty file with header
+      with open('target.tsv', 'w') as f:
+          f.write('\\t'.join(header) + '\\n')
+  
+  print(f"Matched {len(all_rows)} PSMs from percolator to TSV")
+  """
+}
+
+// Merge the two channels
+mzidtsv_perco_standard
+  .mix(mzidtsv_perco_timstof)
+  .set { mzidtsv_perco }
 
 mzidtsv_perco
   .combine(spec_lookup)
