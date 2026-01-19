@@ -474,6 +474,7 @@ delta_mass_exclude_ranges = (-1.5,3.5)
 fragment_ion_series = b,y
 
 search_enzyme_name_1 = nonspecific
+search_enzyme_name = nonspecific
 search_enzyme_cut_1 = 
 search_enzyme_nocut_1 = 
 search_enzyme_sense_1 = C
@@ -481,8 +482,6 @@ allowed_missed_cleavage_1 = ${params.maxmiscleav}
 num_enzyme_termini = 0
 
 clip_nTerm_M = 1
-max_variable_mods_per_peptide = 3
-max_variable_mods_combinations = 5000
 
 output_format = pepxml_pin
 output_report_topN = 1
