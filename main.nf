@@ -63,13 +63,20 @@ if (!params.mzmldef && !params.input) {
 }
 
 
-// Split input based on search engine
-if (search_engine == 'msgf') {
-  mzml_raw.set { mzml_to_filter }
-  Channel.empty().set { mzml_to_passthrough }
-} else {
+// Route files based on search engine
+// For FragPipe: ALL files bypass filterMzML (go to passthrough)
+// For MSGF+: Only .mzML files go to filterMzML, .d files bypass
+if (search_engine == 'fragpipe') {
+  // FragPipe mode: send everything to passthrough, nothing to filter
   Channel.empty().set { mzml_to_filter }
   mzml_raw.set { mzml_to_passthrough }
+} else {
+  // MSGF+ mode: use choice to split by file extension
+  mzml_to_filter = Channel.create()
+  mzml_to_passthrough = Channel.create()
+  mzml_raw.choice(mzml_to_filter, mzml_to_passthrough) { item ->
+    item[0].name.endsWith('.d') ? 1 : 0
+  }
 }
 
 process filterMzML {
@@ -104,7 +111,9 @@ process passThroughRaw {
   """
 }
 
-// Merge
+// Merge filtered and passthrough files
+// When filterMzML doesn't run (FragPipe mode), mzml_filtered is empty but still exists
+// because Channel.empty() goes to mzml_to_filter, producing an empty mzml_filtered
 mzml_filtered
   .mix(mzml_passthrough)
   .tap { sets; mzmlcounter }
@@ -321,7 +330,7 @@ process prepareFilterDB {
 
 process IsobaricQuant {
 
-  when: !params.quantlookup && params.isobaric
+  when: !params.quantlookup && params.isobaric && search_engine != 'fragpipe'
 
   input:
   set val(setname), val(sample), file(infile), val(strip), val(fraction) from mzml_isobaric
@@ -360,7 +369,7 @@ process createNewSpectraLookup {
 
   publishDir "${params.outdir}", mode: 'copy', overwrite: true, saveAs: {it == 'mslookup_db.sqlite' ? 'quant_lookup.sql' : null }
 
-  when: !params.quantlookup
+  when: !params.quantlookup && search_engine != 'fragpipe'
 
   input:
   file(isobxmls) from sorted_isoxml 
@@ -382,13 +391,14 @@ process createNewSpectraLookup {
 }
 
 
-if (!params.quantlookup) {
-  newspeclookup
-    .set { spec_lookup }
+// Set up spec_lookup channel based on mode
+if (params.quantlookup) {
+  Channel.fromPath(params.quantlookup).set { spec_lookup }
+} else if (search_engine == 'fragpipe') {
+  // FragPipe/timsTOF mode: create dummy file channel (createPSMTable handles this case)
+  Channel.from(file('NO_LOOKUP')).set { spec_lookup }
 } else {
-  Channel
-    .fromPath(params.quantlookup)
-    .set { spec_lookup }
+  newspeclookup.set { spec_lookup }
 } 
 
 
@@ -437,60 +447,89 @@ process fragPipeSearch {
   
   output:
   set val(setname), val(sample), file("${sample}.pepXML") into pepxml_files
+  set val(setname), val(sample), file("${sample}.pin") into pin_files
   
   script:
   """
   # Parse MSGF+ mods file to MSFragger format
   parse_msgf_mods_to_fragger.py $mods fragger_mods.txt
   
-  # Create MSFragger parameter file
+  # Create MSFragger parameter file (MSFragger 4.4.1)
   cat > fragger.params <<EOF
+num_threads = ${task.cpus * params.threadspercore}
 database_name = $db
 decoy_prefix = decoy_
-keep_decoys = 0
-precursor_mass_lower = -15
-precursor_mass_upper = 15
+
+precursor_mass_lower = -20.0
+precursor_mass_upper = 20.0
 precursor_mass_units = 1
-precursor_true_tolerance = 20
+precursor_true_tolerance = 20.0
 precursor_true_units = 1
-fragment_mass_tolerance = 20
+fragment_mass_tolerance = 20.0
 fragment_mass_units = 1
-isotope_error = -1/0/1/2
 calibrate_mass = 2
-search_enzyme_name = nonspecific
-num_enzyme_termini = 2
-allowed_missed_cleavage_1 = ${params.maxmiscleav}
+
+isotope_error = 0
+delta_mass_exclude_ranges = (-1.5,3.5)
+fragment_ion_series = b,y
+
+search_enzyme_name_1 = nonspecific
+search_enzyme_cut_1 = 
+search_enzyme_nocut_1 = 
 search_enzyme_sense_1 = C
-search_enzyme_cut_1 = @
-search_enzyme_sense_2 = C
-search_enzyme_cut_2 = @
+allowed_missed_cleavage_1 = ${params.maxmiscleav}
+num_enzyme_termini = 0
+
 clip_nTerm_M = 1
+max_variable_mods_per_peptide = 3
+max_variable_mods_combinations = 5000
+
+output_format = pepxml_pin
+output_report_topN = 1
+output_max_expect = 50.0
+
+precursor_charge = 2 3
 digest_min_length = ${params.minlen}
 digest_max_length = ${params.maxlen}
-digest_mass_range_low = 300.0
-digest_mass_range_high = 5000.0
-precursor_charge = 2 4
+digest_mass_range = 300.0 5000.0
+
+deisotope = 1
+deneutralloss = 1
+minimum_peaks = 15
+use_topN_peaks = 300
+min_matched_fragments = 4
+intensity_transform = 1
+activation_types = all
+analyzer_types = all
+remove_precursor_peak = 1
+remove_precursor_range = -1.5,1.5
+
 \$(cat fragger_mods.txt)
-ms_level = 2
-activation_types = ALL
-output_format = pepXML
-output_report_topN = 1
-output_max_expect = 50
-num_threads = ${task.cpus * params.threadspercore}
-fragment_ion_series = b,y
-write_calibrated_mzml = 0
 EOF
 
-  # Run MSFragger with Java 17
+  # Run MSFragger
   java -Xmx${task.memory.toMega()}M -jar ${params.msfragger_jar} fragger.params $mzml
   
-  # Rename output if needed
+  # Rename outputs (MSFragger outputs with input file basename)
   BASENAME=\$(basename $mzml .mzML)
+  BASENAME=\$(basename \$BASENAME .d)
   if [ "\${BASENAME}.pepXML" != "${sample}.pepXML" ]; then
     mv \${BASENAME}.pepXML ${sample}.pepXML
   fi
+  if [ "\${BASENAME}.pin" != "${sample}.pin" ]; then
+    mv \${BASENAME}.pin ${sample}.pin
+  fi
   """
 }
+
+// For FragPipe: pepXML goes to mzid conversion for TSV creation
+// PIN files go directly to percolator (MSFragger generates them with pepxml_pin output)
+pepxml_files.set { pepxml_for_mzid }
+
+// Route PIN files to percolator
+pin_files
+  .groupTuple()
+  .set { pin_for_percolator }
 
 process convertPepXMLToMzid {
 
@@ -499,7 +538,7 @@ process convertPepXMLToMzid {
   conda "/home/il364/.conda/envs/proteogenomics"
 
   input:
-  set val(setname), val(sample), path(pepxml) from pepxml_files
+  set val(setname), val(sample), path(pepxml) from pepxml_for_mzid
   
   output:
   set val(setname), val(sample), file("${sample}.mzid") into mzid_files
@@ -519,10 +558,8 @@ process convertPepXMLToMzid {
   """
 }
 
-// Split mzid_files: one copy for mzids_fragpipe channel, one for TSV conversion
-mzid_files
-  .tap { mzids_fragpipe }
-  .set { mzid_files_for_tsv }
+// mzid_files only used for TSV conversion now (not percolator)
+mzid_files.set { mzid_files_for_tsv }
 
 process convertMzidToTSV {
 
@@ -554,30 +591,28 @@ process convertMzidToTSV {
   """
 }
 
-// Combine outputs from both search engines
-// Note: When a process doesn't run due to `when`, its output channels exist but are empty.
-// The tap above ensures mzids_fragpipe is defined from mzid_files.
-// mzids_msgf/mzidtsvs_msgf come from msgfPlus, mzidtsvs_fragpipe comes from convertMzidToTSV.
-
-mzids_msgf.mix(mzids_fragpipe).set { mzids }
+// Combine TSV outputs from both search engines (for downstream PSM table)
 mzidtsvs_msgf.mix(mzidtsvs_fragpipe).set { mzidtsvs }
 
 // ============================================================================
-// END SEARCH ENGINE PROCESSES
+// PERCOLATOR SECTION - Separate paths for MSGF+ and FragPipe
 // ============================================================================
 
-mzids
+// MSGF+ path: mzid files work with msgf2pin
+mzids_msgf
   .groupTuple()
   .set { mzids_2pin }
 
-
-process percolator {
+process percolator_msgf {
+  when: search_engine == 'msgf'
+  
   input:
   set val(setname), val(samples), file('mzid?') from mzids_2pin
+  
   output:
-  set val(setname), file('perco.xml') into percolated
+  set val(setname), file('perco.xml') into percolated_msgf
+  
   script:
-  mzmlcount = samples.size() 
   """
   mkdir mzids
   count=1;for sam in ${samples.join(' ')}; do ln -s `pwd`/mzid\$count mzids/\${sam}.mzid; echo mzids/\${sam}.mzid >> metafile; ((count++));done
@@ -585,6 +620,34 @@ process percolator {
   percolator -j percoin.xml -X perco.xml -N 500000 --decoy-xml-output -y --subset-max-train 300000
   """
 }
+
+// FragPipe path: use PIN files directly from MSFragger (output_format = pepxml_pin)
+process percolator_fragpipe {
+  when: search_engine == 'fragpipe'
+  
+  input:
+  set val(setname), val(samples), file('*.pin') from pin_for_percolator
+  
+  output:
+  set val(setname), file('perco.xml') into percolated_fragpipe
+  
+  script:
+  """
+  # Merge all PIN files (keep header from first file only)
+  head -1 \$(ls *.pin | head -1) > merged.pin
+  for f in *.pin; do
+    tail -n +2 "\$f" >> merged.pin
+  done
+  
+  # Run Percolator
+  percolator -j merged.pin -X perco.xml -N 500000 --decoy-xml-output -y --subset-max-train 300000
+  """
+}
+
+// Merge percolator outputs from both search engines
+percolated_msgf
+  .mix(percolated_fragpipe)
+  .set { percolated }
 
 
 percolated
@@ -772,20 +835,26 @@ process svmToTSV_timsTOF {
       # Get filename from mzid
       for spec_data in root.findall('.//mzid:SpectraData', mzid_ns):
           location = spec_data.get('location', '')
-          mzid_filename = location.split('/')[-1].replace('.mzML', '').replace('_filtered', '')
-          
+          mzid_filename = location.split('/')[-1].replace('.mzML', '').replace('.d', '').replace('_filtered', '')
+      
+      # PRE-BUILD peptide ID -> sequence mapping (fixes O(n²) issue)
+      peptide_sequences = {}
+      for pep_elem in root.findall('.//mzid:Peptide', mzid_ns):
+          pep_id = pep_elem.get('id')
+          pep_seq = pep_elem.find('mzid:PeptideSequence', mzid_ns)
+          if pep_seq is not None and pep_id:
+              peptide_sequences[pep_id] = pep_seq.text
+      
       for spec_result in root.findall('.//mzid:SpectrumIdentificationResult', mzid_ns):
           spec_id = spec_result.get('spectrumID')
           for spec_item in spec_result.findall('mzid:SpectrumIdentificationItem', mzid_ns):
               charge = spec_item.get('chargeState')
               peptide_ref = spec_item.get('peptide_ref')
-              # Get peptide sequence
-              for pep_elem in root.findall(f".//mzid:Peptide[@id='{peptide_ref}']", mzid_ns):
-                  pep_seq = pep_elem.find('mzid:PeptideSequence', mzid_ns)
-                  if pep_seq is not None:
-                      seq = pep_seq.text
-                      key = (mzid_filename, seq, charge)
-                      mzid_mapping[key] = spec_id
+              # Get peptide sequence from pre-built dict (O(1) lookup)
+              seq = peptide_sequences.get(peptide_ref)
+              if seq:
+                  key = (mzid_filename, seq, charge)
+                  mzid_mapping[key] = spec_id
 
   # Process TSV files
   all_rows = []
@@ -800,7 +869,7 @@ process svmToTSV_timsTOF {
           for row in reader:
               # Extract info for matching
               spec_file = row.get('#SpecFile', row.get('SpecFile', ''))
-              filename = spec_file.split('/')[-1].replace('.mzML', '').replace('_filtered', '')
+              filename = spec_file.split('/')[-1].replace('.mzML', '').replace('.d', '').replace('_filtered', '')
               peptide = row.get('Peptide', '')
               charge = row.get('Charge', '')
               
@@ -850,6 +919,16 @@ process createPSMTable {
   set val(setname), val(peptype), file("${setname}_${peptype}_psmtable.txt") into psmtable
 
   script:
+  // For FragPipe/timsTOF: skip spectra lookup (--dbfile), just filter and create basic table
+  if (search_engine == 'fragpipe')
+  """
+  msstitch conffilt -i psms -o filtpsm --confidence-better lower --confidence-lvl 0.01 --confcolpattern 'PSM q-value'
+  msstitch conffilt -i filtpsm -o filtpep --confidence-better lower --confidence-lvl 0.01 --confcolpattern 'peptide q-value'
+  # Create PSM table without spectra lookup for timsTOF
+  cp filtpep ${setname}_${peptype}_psmtable.txt
+  sed 's/\\#SpecFile/SpectraFile/' -i ${setname}_${peptype}_psmtable.txt
+  """
+  else
   """
   msstitch conffilt -i psms -o filtpsm --confidence-better lower --confidence-lvl 0.01 --confcolpattern 'PSM q-value'
   msstitch conffilt -i filtpsm -o filtpep --confidence-better lower --confidence-lvl 0.01 --confcolpattern 'peptide q-value'
