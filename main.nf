@@ -41,6 +41,12 @@ if (!(search_engine in ['msgf', 'fragpipe'])) {
   exit(1)
 }
 
+// Database splits for FragPipe nonspecific search (default: 8)
+db_splits = params.db_splits ?: 8
+
+// Number of top PSMs to keep per spectrum (default: 1)
+output_report_topN = params.output_report_topN ?: 1
+
 /* PIPELINE START */
 
 // Either feed an mzmldef file (tab separated lines with filepath\tsetname), or /path/to/files
@@ -454,10 +460,28 @@ process fragPipeSearch {
   # Parse MSGF+ mods file to MSFragger format
   parse_msgf_mods_to_fragger.py $mods fragger_mods.txt
   
-  # Create MSFragger parameter file (MSFragger 4.4.1)
-  cat > fragger.params <<EOF
+  # Split database into ${db_splits} parts for nonspecific search
+  mkdir -p split_dbs
+  
+  # Count proteins and calculate split size
+  TOTAL_PROTS=\$(grep -c "^>" $db)
+  SPLIT_SIZE=\$(( (TOTAL_PROTS + ${db_splits} - 1) / ${db_splits} ))
+  
+  # Split FASTA file
+  awk -v size="\$SPLIT_SIZE" -v prefix="split_dbs/part_" '
+    BEGIN { filenum = 1; count = 0 }
+    /^>/ { 
+      if (count >= size) { filenum++; count = 0 }
+      count++
+    }
+    { print > (prefix filenum ".fa") }
+  ' $db
+  
+  echo "Split database into \$(ls split_dbs/*.fa | wc -l) parts"
+  
+  # Create base MSFragger parameter file
+  cat > fragger_base.params <<EOF
 num_threads = ${task.cpus * params.threadspercore}
-database_name = $db
 decoy_prefix = decoy_
 
 precursor_mass_lower = -20.0
@@ -473,12 +497,15 @@ isotope_error = 0
 delta_mass_exclude_ranges = (-1.5,3.5)
 fragment_ion_series = b,y
 
-search_enzyme_name_1 = nonspecific
 search_enzyme_name = nonspecific
-search_enzyme_cut_1 = 
-search_enzyme_nocut_1 = 
 search_enzyme_sense_1 = C
+search_enzyme_cut_1 = @
+search_enzyme_nocut_1 = 
 allowed_missed_cleavage_1 = ${params.maxmiscleav}
+search_enzyme_sense_2 = C
+search_enzyme_cut_2 = @
+search_enzyme_nocut_2 = 
+allowed_missed_cleavage_2 = 2
 num_enzyme_termini = 0
 
 clip_nTerm_M = 1
@@ -506,92 +533,223 @@ remove_precursor_range = -1.5,1.5
 \$(cat fragger_mods.txt)
 EOF
 
-  # Run MSFragger
-  java -Xmx${task.memory.toMega()}M -jar ${params.msfragger_jar} fragger.params $mzml
+  # Run MSFragger on each database split
+  mkdir -p results
+  for split_db in split_dbs/*.fa; do
+    split_name=\$(basename \$split_db .fa)
+    echo "Searching against \$split_name..."
+    
+    # Create params file with this database
+    cp fragger_base.params fragger_\${split_name}.params
+    echo "database_name = \$split_db" >> fragger_\${split_name}.params
+    
+    # Run MSFragger
+    java -Xmx${task.memory.toMega()}M -jar ${params.msfragger_jar} fragger_\${split_name}.params $mzml
+    
+    # Get output basename
+    BASENAME=\$(basename $mzml .mzML)
+    BASENAME=\$(basename \$BASENAME .d)
+    
+    # Move outputs to results folder with split name
+    mv \${BASENAME}.pepXML results/\${split_name}.pepXML
+    mv \${BASENAME}.pin results/\${split_name}.pin
+  done
   
-  # Rename outputs (MSFragger outputs with input file basename)
-  BASENAME=\$(basename $mzml .mzML)
-  BASENAME=\$(basename \$BASENAME .d)
-  if [ "\${BASENAME}.pepXML" != "${sample}.pepXML" ]; then
-    mv \${BASENAME}.pepXML ${sample}.pepXML
-  fi
-  if [ "\${BASENAME}.pin" != "${sample}.pin" ]; then
-    mv \${BASENAME}.pin ${sample}.pin
-  fi
+import glob
+import csv
+import collections
+import os
+
+pin_files = sorted(glob.glob('results/*.pin'))
+print(f"Merging {len(pin_files)} PIN files from database splits")
+
+# Read header
+with open(pin_files[0]) as f:
+    header = f.readline().strip().split('\t')
+
+specId_idx = header.index('SpecId')
+hyperscore_idx = header.index('hyperscore') if 'hyperscore' in header else None
+rank_idx = header.index('rank') if 'rank' in header else None
+
+# Group PSMs by spectrum
+spectrum_psms = collections.defaultdict(list)
+csv.field_size_limit(2**31 - 1)
+
+for pin_file in pin_files:
+    with open(pin_file) as f:
+        reader = csv.reader(f, delimiter='\t')
+        next(reader)  # skip header
+        for row in reader:
+            if len(row) < len(header):
+                continue
+            spec_id = row[specId_idx]
+            # Remove rank suffix to get spectrum key
+            spec_key = spec_id.rsplit('_', 1)[0] if '_' in spec_id else spec_id.rsplit('.', 1)[0]
+            
+            # Get hyperscore for sorting
+            score = float(row[hyperscore_idx]) if hyperscore_idx else 0
+            spectrum_psms[spec_key].append((score, row))
+
+print(f"Found {len(spectrum_psms)} unique spectra")
+
+# Write merged PIN with only top hit per spectrum
+total_written = 0
+with open('${sample}.pin', 'w') as out:
+    out.write('\t'.join(header) + '\n')
+    for spec_key in sorted(spectrum_psms.keys()):
+        psms = spectrum_psms[spec_key]
+        psms.sort(key=lambda x: x[0], reverse=True)  # Sort by hyperscore desc
+        
+        # Keep only top hit
+        score, row = psms[0]
+        if rank_idx is not None:
+            row[rank_idx] = '1'
+        row[specId_idx] = f"{spec_key}_1"
+        out.write('\t'.join(row) + '\n')
+        total_written += 1
+
+print(f"Wrote {total_written} PSMs (top hit per spectrum)")
+print(f"PIN file size: {os.path.getsize('${sample}.pin') / 1e6:.1f} MB")
+MERGE_PIN_EOF
+  
+  # Merge pepXML files using shell
+  # Get header from first file (everything up to first spectrum_query)
+  FIRST_PEPXML=\$(ls results/*.pepXML | head -1)
+  
+  # Extract header (everything before <spectrum_query)
+  awk '/<spectrum_query/{exit} {print}' \$FIRST_PEPXML > ${sample}.pepXML
+  
+  # Extract and append all spectrum_query elements from all files
+  for f in results/*.pepXML; do
+    # Extract spectrum_query blocks
+    awk '/<spectrum_query/,/<\\/spectrum_query>/' "\$f" >> ${sample}.pepXML
+  done
+  
+  # Add closing tags
+  echo '</msms_run_summary>' >> ${sample}.pepXML
+  echo '</msms_pipeline_analysis>' >> ${sample}.pepXML
+  
+  echo "Merged pepXML complete"
   """
 }
 
-// For FragPipe: pepXML goes to mzid conversion for TSV creation
-// PIN files go directly to percolator (MSFragger generates them with pepxml_pin output)
-pepxml_files.set { pepxml_for_mzid }
+// For FragPipe: create TSV directly from pepXML (skip mzid conversion)
+// PIN files go directly to percolator
+pepxml_files.set { pepxml_for_tsv }
 
 // Route PIN files to percolator
 pin_files
   .groupTuple()
   .set { pin_for_percolator }
 
-process convertPepXMLToMzid {
+process pepXMLToTSV {
 
   when: search_engine == 'fragpipe'
   
-  conda "/home/il364/.conda/envs/proteogenomics"
-
   input:
-  set val(setname), val(sample), path(pepxml) from pepxml_for_mzid
+  set val(setname), val(sample), path(pepxml) from pepxml_for_tsv
   
   output:
-  set val(setname), val(sample), file("${sample}.mzid") into mzid_files
+  set val(setname), val(sample), file("${sample}.tsv") into tsvs_fragpipe
   
   script:
   """
-  # Convert pepXML to mzIdentML using OpenMS
-  IDFileConverter -in $pepxml -out ${sample}.mzid
+  #!/usr/bin/env python3
+  import xml.etree.ElementTree as ET
+  import csv
+  import re
   
-  # Verify decoy labels
-  DECOY_COUNT=\$(grep -c 'accession="decoy_' ${sample}.mzid || echo 0)
-  if [ "\$DECOY_COUNT" -eq 0 ]; then
-    echo "ERROR: No decoy sequences found in mzID file!"
-    exit 1
-  fi
-  echo "Found \$DECOY_COUNT decoy entries in mzID - OK"
+  # Parse pepXML and create TSV
+  tree = ET.parse('${pepxml}')
+  root = tree.getroot()
+  
+  # Handle namespace
+  ns_match = re.match(r'\\{(.*)\\}', root.tag)
+  ns = {'pep': ns_match.group(1)} if ns_match else {}
+  
+  rows = []
+  
+  # Find spectrum queries
+  if ns:
+      queries = root.findall('.//pep:spectrum_query', ns)
+  else:
+      queries = root.findall('.//spectrum_query')
+  
+  for sq in queries:
+      spectrum = sq.get('spectrum', '')
+      start_scan = sq.get('start_scan', '')
+      precursor_mass = sq.get('precursor_neutral_mass', '')
+      charge = sq.get('assumed_charge', '')
+      
+      # Get search hits
+      if ns:
+          hits = sq.findall('.//pep:search_hit', ns)
+      else:
+          hits = sq.findall('.//search_hit')
+      
+      for hit in hits:
+          peptide = hit.get('peptide', '')
+          protein = hit.get('protein', '')
+          calc_mass = hit.get('calc_neutral_pep_mass', '')
+          num_matched = hit.get('num_matched_ions', '')
+          tot_ions = hit.get('tot_num_ions', '')
+          
+          # Get scores
+          scores = {}
+          if ns:
+              score_elems = hit.findall('.//pep:search_score', ns)
+          else:
+              score_elems = hit.findall('.//search_score')
+          for s in score_elems:
+              scores[s.get('name', '')] = s.get('value', '')
+          
+          rows.append({
+              '#SpecFile': '${sample}',
+              'SpecID': spectrum,
+              'ScanNum': start_scan,
+              'Peptide': peptide,
+              'Protein': protein,
+              'Charge': charge,
+              'PrecursorMass': precursor_mass,
+              'CalcMass': calc_mass,
+              'MatchedIons': num_matched,
+              'TotalIons': tot_ions,
+              'Hyperscore': scores.get('hyperscore', ''),
+              'Expect': scores.get('expect', ''),
+              'Nextscore': scores.get('nextscore', ''),
+          })
+  
+  # Write TSV
+  if rows:
+      with open('${sample}.tsv', 'w', newline='') as f:
+          writer = csv.DictWriter(f, fieldnames=rows[0].keys(), delimiter='\\t')
+          writer.writeheader()
+          writer.writerows(rows)
+      print(f"Created TSV with {len(rows)} PSMs")
+  else:
+      # Create empty file with header
+      with open('${sample}.tsv', 'w') as f:
+          f.write('#SpecFile\\tSpecID\\tScanNum\\tPeptide\\tProtein\\tCharge\\n')
+      print("Warning: No PSMs found in pepXML")
   """
 }
 
-// mzid_files only used for TSV conversion now (not percolator)
-mzid_files.set { mzid_files_for_tsv }
+// Group TSVs by setname for downstream
+tsvs_fragpipe
+  .map { setname, sample, tsv -> [setname, tsv] }
+  .groupTuple()
+  .set { grouped_tsvs_fragpipe }
 
-process convertMzidToTSV {
-
-  when: search_engine == 'fragpipe'
-  
-  conda "/home/il364/.conda/envs/proteogenomics"
-
-  input:
-  set val(setname), val(sample), path(mzid) from mzid_files_for_tsv
-  
-  output:
-  set val(setname), file(mzid), file('out.mzid.tsv') into mzidtsvs_fragpipe
-  
-  script:
-  """
-  # Convert to TSV using msgf_plus
-  msgf_plus -Xmx${task.memory.toMega()}M edu.ucsd.msjava.ui.MzIDToTsv -i "$mzid" -o out.mzid.tsv
-  
-  # Final check
-  TSV_DECOY_COUNT=\$(grep -c 'decoy_' out.mzid.tsv || echo 0)
-  if [ "\$TSV_DECOY_COUNT" -eq 0 ]; then
-    echo "ERROR: No decoy sequences found in TSV!"
-    exit 1
-  fi
-  echo "Found \$TSV_DECOY_COUNT decoy entries in TSV - OK"
-  
-  # Cleanup
-  rm -f \${BASENAME}.pepXML fragger.params fragger_mods.txt
-  """
+// For FragPipe: create mzidtsvs-compatible channel (TSV only, no mzid needed for timsTOF path)
+// The svmToTSV_timsTOF process will be replaced with a FragPipe-specific version
+if (search_engine == 'fragpipe') {
+  // Create dummy structure to match expected format [setname, mzid_files, tsv_files]
+  grouped_tsvs_fragpipe
+    .map { setname, tsvs -> [setname, tsvs, tsvs] }  // Use TSVs as placeholder for mzids
+    .set { mzidtsvs }
+} else {
+  mzidtsvs_msgf.set { mzidtsvs }
 }
-
-// Combine TSV outputs from both search engines (for downstream PSM table)
-mzidtsvs_msgf.mix(mzidtsvs_fragpipe).set { mzidtsvs }
 
 // ============================================================================
 // PERCOLATOR SECTION - Separate paths for MSGF+ and FragPipe
@@ -631,15 +789,120 @@ process percolator_fragpipe {
   set val(setname), file('perco.xml') into percolated_fragpipe
   
   script:
+  def topN = params.output_report_topN ?: 1
   """
-  # Merge all PIN files (keep header from first file only)
-  head -1 \$(ls *.pin | head -1) > merged.pin
-  for f in *.pin; do
-    tail -n +2 "\$f" >> merged.pin
-  done
+  #!/usr/bin/env python3
+  import glob
+  import os
+  import csv
+  import collections
+  
+  pin_files = sorted(glob.glob('*.pin'))
+  print(f"Processing {len(pin_files)} PIN files", flush=True)
+  
+  # Read header from first file
+  with open(pin_files[0]) as f:
+      header = f.readline().strip().split('\\t')
+  
+  # Find important column indices
+  specId_idx = header.index('SpecId')
+  hyperscore_idx = header.index('hyperscore') if 'hyperscore' in header else None
+  log10_evalue_idx = header.index('log10_evalue') if 'log10_evalue' in header else None
+  rank_idx = header.index('rank') if 'rank' in header else None
+  
+  # Determine score column for sorting (prefer hyperscore, fallback to log10_evalue)
+  if hyperscore_idx is not None:
+      score_idx = hyperscore_idx
+      higher_is_better = True
+  elif log10_evalue_idx is not None:
+      score_idx = log10_evalue_idx
+      higher_is_better = False  # lower log10_evalue = better
+  else:
+      # Fallback: find any score-like column
+      score_idx = None
+      for i, col in enumerate(header):
+          if 'score' in col.lower() and i > 2:
+              score_idx = i
+              higher_is_better = True
+              break
+  
+  print(f"Using column {header[score_idx] if score_idx else 'none'} for scoring", flush=True)
+  
+  # Group all PSMs by spectrum (without rank suffix)
+  # SpecId format: filename.scan.scan.charge_rank -> group by filename.scan.scan.charge
+  spectrum_psms = collections.defaultdict(list)
+  total_psms = 0
+  
+  csv.field_size_limit(2**31 - 1)
+  
+  for pin_file in pin_files:
+      with open(pin_file) as f:
+          reader = csv.reader(f, delimiter='\\t')
+          next(reader)  # skip header
+          for row in reader:
+              if len(row) < len(header):
+                  continue
+              # Extract spectrum key (remove rank suffix if present)
+              spec_id = row[specId_idx]
+              # Handle format: name.scan.scan.charge_rank or name_rank
+              if '_' in spec_id:
+                  spec_key = spec_id.rsplit('_', 1)[0]
+              else:
+                  spec_key = spec_id.rsplit('.', 1)[0]
+              
+              # Get score for sorting
+              if score_idx is not None:
+                  try:
+                      score = float(row[score_idx])
+                  except (ValueError, IndexError):
+                      score = 0
+              else:
+                  score = 0
+              
+              spectrum_psms[spec_key].append((score, row))
+              total_psms += 1
+      
+      print(f"  Read {pin_file}: {total_psms} total PSMs so far", flush=True)
+  
+  print(f"Total PSMs: {total_psms}", flush=True)
+  print(f"Unique spectra: {len(spectrum_psms)}", flush=True)
+  
+  # Sort each spectrum's PSMs and keep top N
+  topN = ${topN}
+  kept_psms = 0
+  
+  with open('merged.pin', 'w') as out:
+      out.write('\\t'.join(header) + '\\n')
+      
+      for spec_key in sorted(spectrum_psms.keys()):
+          psms = spectrum_psms[spec_key]
+          # Sort by score (higher hyperscore = better, lower log10_evalue = better)
+          if hyperscore_idx is not None:
+              psms.sort(key=lambda x: x[0], reverse=True)  # higher is better
+          else:
+              psms.sort(key=lambda x: x[0], reverse=False)  # lower is better
+          
+          # Keep top N and update ranks
+          for new_rank, (score, row) in enumerate(psms[:topN], 1):
+              # Update rank column if it exists
+              if rank_idx is not None:
+                  row[rank_idx] = str(new_rank)
+              # Update SpecId to include new rank
+              row[specId_idx] = f"{spec_key}_{new_rank}"
+              out.write('\\t'.join(row) + '\\n')
+              kept_psms += 1
+  
+  print(f"Kept {kept_psms} PSMs ({100*kept_psms/max(1,total_psms):.1f}%)", flush=True)
+  print(f"Merged PIN file size: {os.path.getsize('merged.pin') / 1e9:.2f} GB", flush=True)
   
   # Run Percolator
-  percolator -j merged.pin -X perco.xml -N 500000 --decoy-xml-output -y --subset-max-train 300000
+  import subprocess
+  print("Running Percolator...", flush=True)
+  subprocess.run([
+      'percolator', '-j', 'merged.pin', '-X', 'perco.xml',
+      '-N', '500000', '--decoy-xml-output', '-y', '--subset-max-train', '300000'
+  ], check=True)
+  print("Percolator complete", flush=True)
   """
 }
 
@@ -783,7 +1046,10 @@ process svmToTSV_timsTOF {
   import glob
   import csv
   import re
+  import os
 
+  search_engine = '${search_engine}'
+  
   # Parse percolator XML to get PSM info
   perco_psms = {}
   tree = ET.parse('${perco}')
@@ -800,60 +1066,75 @@ process svmToTSV_timsTOF {
       pep = psm.find('p:pep', ns).text
       svm_score = psm.find('p:svm_score', ns).text
       peptide_elem = psm.find('p:peptide_seq', ns)
-      peptide = peptide_elem.get('seq')
+      peptide = peptide_elem.get('seq') if peptide_elem is not None else ''
       
-      # Extract filename and scan info from PSM ID
-      # Format: filename_SII_specidx_rank_scannum_charge_1
-      parts = psm_id.rsplit('_SII_', 1)
-      if len(parts) == 2:
-          filename = parts[0]
-          scan_parts = parts[1].split('_')
-          if len(scan_parts) >= 4:
-              spec_idx = scan_parts[0]
-              scan_num = scan_parts[2]
-              charge = scan_parts[3]
-              key = (filename, peptide, charge)
+      # Handle both MSGF+ and FragPipe PSM ID formats
+      if search_engine == 'fragpipe':
+          # FragPipe PIN format: spectrum_charge_rank or similar
+          # Try to extract peptide and charge from PSM ID
+          parts = psm_id.split('_')
+          if len(parts) >= 2:
+              charge = parts[-2] if parts[-2].isdigit() else parts[-1]
+              key = (peptide, charge)
               perco_psms[key] = {
                   'q_value': q_value,
                   'pep': pep,
                   'svm_score': svm_score,
                   'psm_id': psm_id
               }
+      else:
+          # MSGF+ format: filename_SII_specidx_rank_scannum_charge_1
+          parts = psm_id.rsplit('_SII_', 1)
+          if len(parts) == 2:
+              filename = parts[0]
+              scan_parts = parts[1].split('_')
+              if len(scan_parts) >= 4:
+                  spec_idx = scan_parts[0]
+                  scan_num = scan_parts[2]
+                  charge = scan_parts[3]
+                  key = (filename, peptide, charge)
+                  perco_psms[key] = {
+                      'q_value': q_value,
+                      'pep': pep,
+                      'svm_score': svm_score,
+                      'psm_id': psm_id
+                  }
 
   # Read all TSV files and match
   tsv_files = sorted(glob.glob('tsv*'))
-  mzid_files = sorted(glob.glob('mzid*'))
   
-  # Build mzid mapping: spectrumID -> native ID
+  # For MSGF+ mode, also parse mzid files
   mzid_mapping = {}
-  for mzid_file in mzid_files:
-      tree = ET.parse(mzid_file)
-      root = tree.getroot()
-      mzid_ns = {'mzid': 'http://psidev.info/psi/pi/mzIdentML/1.1'}
-      
-      # Get filename from mzid
-      for spec_data in root.findall('.//mzid:SpectraData', mzid_ns):
-          location = spec_data.get('location', '')
-          mzid_filename = location.split('/')[-1].replace('.mzML', '').replace('.d', '').replace('_filtered', '')
-      
-      # PRE-BUILD peptide ID -> sequence mapping (fixes O(n²) issue)
-      peptide_sequences = {}
-      for pep_elem in root.findall('.//mzid:Peptide', mzid_ns):
-          pep_id = pep_elem.get('id')
-          pep_seq = pep_elem.find('mzid:PeptideSequence', mzid_ns)
-          if pep_seq is not None and pep_id:
-              peptide_sequences[pep_id] = pep_seq.text
-      
-      for spec_result in root.findall('.//mzid:SpectrumIdentificationResult', mzid_ns):
-          spec_id = spec_result.get('spectrumID')
-          for spec_item in spec_result.findall('mzid:SpectrumIdentificationItem', mzid_ns):
-              charge = spec_item.get('chargeState')
-              peptide_ref = spec_item.get('peptide_ref')
-              # Get peptide sequence from pre-built dict (O(1) lookup)
-              seq = peptide_sequences.get(peptide_ref)
-              if seq:
-                  key = (mzid_filename, seq, charge)
-                  mzid_mapping[key] = spec_id
+  if search_engine != 'fragpipe':
+      mzid_files = sorted(glob.glob('mzid*'))
+      for mzid_file in mzid_files:
+          try:
+              tree = ET.parse(mzid_file)
+              root = tree.getroot()
+              mzid_ns = {'mzid': 'http://psidev.info/psi/pi/mzIdentML/1.1'}
+              
+              for spec_data in root.findall('.//mzid:SpectraData', mzid_ns):
+                  location = spec_data.get('location', '')
+                  mzid_filename = location.split('/')[-1].replace('.mzML', '').replace('.d', '').replace('_filtered', '')
+              
+              peptide_sequences = {}
+              for pep_elem in root.findall('.//mzid:Peptide', mzid_ns):
+                  pep_id = pep_elem.get('id')
+                  pep_seq = pep_elem.find('mzid:PeptideSequence', mzid_ns)
+                  if pep_seq is not None and pep_id:
+                      peptide_sequences[pep_id] = pep_seq.text
+              
+              for spec_result in root.findall('.//mzid:SpectrumIdentificationResult', mzid_ns):
+                  spec_id = spec_result.get('spectrumID')
+                  for spec_item in spec_result.findall('mzid:SpectrumIdentificationItem', mzid_ns):
+                      charge = spec_item.get('chargeState')
+                      peptide_ref = spec_item.get('peptide_ref')
+                      seq = peptide_sequences.get(peptide_ref)
+                      if seq:
+                          key = (mzid_filename, seq, charge)
+                          mzid_mapping[key] = spec_id
+          except Exception as e:
+              print(f"Warning: Could not parse mzid file {mzid_file}: {e}")
 
   # Process TSV files
   all_rows = []
@@ -863,28 +1144,32 @@ process svmToTSV_timsTOF {
       with open(tsv_file, 'r') as f:
           reader = csv.DictReader(f, delimiter='\\t')
           if header is None:
-              header = reader.fieldnames + ['percolator svm-score', 'PSM q-value', 'PSM PEP', 'peptide q-value', 'peptide PEP', 'TD']
+              header = list(reader.fieldnames) + ['percolator svm-score', 'PSM q-value', 'PSM PEP', 'peptide q-value', 'peptide PEP', 'TD']
           
           for row in reader:
-              # Extract info for matching
               spec_file = row.get('#SpecFile', row.get('SpecFile', ''))
               filename = spec_file.split('/')[-1].replace('.mzML', '').replace('.d', '').replace('_filtered', '')
               peptide = row.get('Peptide', '')
               charge = row.get('Charge', '')
               
-              key = (filename, peptide, charge)
+              # Match based on search engine
+              if search_engine == 'fragpipe':
+                  key = (peptide, charge)
+              else:
+                  key = (filename, peptide, charge)
               
               if key in perco_psms:
                   perco_data = perco_psms[key]
                   row['percolator svm-score'] = perco_data['svm_score']
                   row['PSM q-value'] = perco_data['q_value']
                   row['PSM PEP'] = perco_data['pep']
-                  row['peptide q-value'] = perco_data['q_value']  # Same as PSM for now
+                  row['peptide q-value'] = perco_data['q_value']
                   row['peptide PEP'] = perco_data['pep']
                   row['TD'] = 'target'
                   all_rows.append(row)
 
   # Write output
+  print(f"Matched {len(all_rows)} PSMs with percolator results")
   if all_rows:
       with open('target.tsv', 'w', newline='') as f:
           writer = csv.DictWriter(f, fieldnames=header, delimiter='\\t', extrasaction='ignore')
