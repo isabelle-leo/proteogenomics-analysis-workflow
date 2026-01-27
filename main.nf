@@ -497,6 +497,7 @@ isotope_error = 0
 delta_mass_exclude_ranges = (-1.5,3.5)
 fragment_ion_series = b,y
 
+# Nonspecific digestion for immunopeptidomics
 search_enzyme_name = nonspecific
 search_enzyme_sense_1 = C
 search_enzyme_cut_1 = @
@@ -555,11 +556,15 @@ EOF
     mv \${BASENAME}.pin results/\${split_name}.pin
   done
   
+  # Merge PIN files - keep only top hit per spectrum 
+cat > merge_pins.py << 'PYEOF'
 import glob
 import csv
 import collections
 import os
+import sys
 
+sample_name = sys.argv[1]
 pin_files = sorted(glob.glob('results/*.pin'))
 print(f"Merging {len(pin_files)} PIN files from database splits")
 
@@ -594,7 +599,8 @@ print(f"Found {len(spectrum_psms)} unique spectra")
 
 # Write merged PIN with only top hit per spectrum
 total_written = 0
-with open('${sample}.pin', 'w') as out:
+outfile = f"{sample_name}.pin"
+with open(outfile, 'w') as out:
     out.write('\t'.join(header) + '\n')
     for spec_key in sorted(spectrum_psms.keys()):
         psms = spectrum_psms[spec_key]
@@ -609,8 +615,9 @@ with open('${sample}.pin', 'w') as out:
         total_written += 1
 
 print(f"Wrote {total_written} PSMs (top hit per spectrum)")
-print(f"PIN file size: {os.path.getsize('${sample}.pin') / 1e6:.1f} MB")
-MERGE_PIN_EOF
+print(f"PIN file size: {os.path.getsize(outfile) / 1e6:.1f} MB")
+PYEOF
+  python3 merge_pins.py "${sample}"
   
   # Merge pepXML files using shell
   # Get header from first file (everything up to first spectrum_query)
@@ -791,118 +798,112 @@ process percolator_fragpipe {
   script:
   def topN = params.output_report_topN ?: 1
   """
-  #!/usr/bin/env python3
-  import glob
-  import os
-  import csv
-  import collections
-  
-  pin_files = sorted(glob.glob('*.pin'))
-  print(f"Processing {len(pin_files)} PIN files", flush=True)
-  
-  # Read header from first file
-  with open(pin_files[0]) as f:
-      header = f.readline().strip().split('\\t')
-  
-  # Find important column indices
-  specId_idx = header.index('SpecId')
-  hyperscore_idx = header.index('hyperscore') if 'hyperscore' in header else None
-  log10_evalue_idx = header.index('log10_evalue') if 'log10_evalue' in header else None
-  rank_idx = header.index('rank') if 'rank' in header else None
-  
-  # Determine score column for sorting (prefer hyperscore, fallback to log10_evalue)
-  if hyperscore_idx is not None:
-      score_idx = hyperscore_idx
-      higher_is_better = True
-  elif log10_evalue_idx is not None:
-      score_idx = log10_evalue_idx
-      higher_is_better = False  # lower log10_evalue = better
-  else:
-      # Fallback: find any score-like column
-      score_idx = None
-      for i, col in enumerate(header):
-          if 'score' in col.lower() and i > 2:
-              score_idx = i
-              higher_is_better = True
-              break
-  
-  print(f"Using column {header[score_idx] if score_idx else 'none'} for scoring", flush=True)
-  
-  # Group all PSMs by spectrum (without rank suffix)
-  # SpecId format: filename.scan.scan.charge_rank -> group by filename.scan.scan.charge
-  spectrum_psms = collections.defaultdict(list)
-  total_psms = 0
-  
-  csv.field_size_limit(2**31 - 1)
-  
-  for pin_file in pin_files:
-      with open(pin_file) as f:
-          reader = csv.reader(f, delimiter='\\t')
-          next(reader)  # skip header
-          for row in reader:
-              if len(row) < len(header):
-                  continue
-              # Extract spectrum key (remove rank suffix if present)
-              spec_id = row[specId_idx]
-              # Handle format: name.scan.scan.charge_rank or name_rank
-              if '_' in spec_id:
-                  spec_key = spec_id.rsplit('_', 1)[0]
-              else:
-                  spec_key = spec_id.rsplit('.', 1)[0]
-              
-              # Get score for sorting
-              if score_idx is not None:
-                  try:
-                      score = float(row[score_idx])
-                  except (ValueError, IndexError):
-                      score = 0
-              else:
-                  score = 0
-              
-              spectrum_psms[spec_key].append((score, row))
-              total_psms += 1
-      
-      print(f"  Read {pin_file}: {total_psms} total PSMs so far", flush=True)
-  
-  print(f"Total PSMs: {total_psms}", flush=True)
-  print(f"Unique spectra: {len(spectrum_psms)}", flush=True)
-  
-  # Sort each spectrum's PSMs and keep top N
-  topN = ${topN}
-  kept_psms = 0
-  
-  with open('merged.pin', 'w') as out:
-      out.write('\\t'.join(header) + '\\n')
-      
-      for spec_key in sorted(spectrum_psms.keys()):
-          psms = spectrum_psms[spec_key]
-          # Sort by score (higher hyperscore = better, lower log10_evalue = better)
-          if hyperscore_idx is not None:
-              psms.sort(key=lambda x: x[0], reverse=True)  # higher is better
-          else:
-              psms.sort(key=lambda x: x[0], reverse=False)  # lower is better
-          
-          # Keep top N and update ranks
-          for new_rank, (score, row) in enumerate(psms[:topN], 1):
-              # Update rank column if it exists
-              if rank_idx is not None:
-                  row[rank_idx] = str(new_rank)
-              # Update SpecId to include new rank
-              row[specId_idx] = f"{spec_key}_{new_rank}"
-              out.write('\\t'.join(row) + '\\n')
-              kept_psms += 1
-  
-  print(f"Kept {kept_psms} PSMs ({100*kept_psms/max(1,total_psms):.1f}%)", flush=True)
-  print(f"Merged PIN file size: {os.path.getsize('merged.pin') / 1e9:.2f} GB", flush=True)
-  
-  # Run Percolator
-  import subprocess
-  print("Running Percolator...", flush=True)
-  subprocess.run([
-      'percolator', '-j', 'merged.pin', '-X', 'perco.xml',
-      '-N', '500000', '--decoy-xml-output', '-y', '--subset-max-train', '300000'
-  ], check=True)
-  print("Percolator complete", flush=True)
+  # Write Python script to file to avoid heredoc escaping issues
+  cat > merge_and_run_perco.py << 'PYEOF'
+import glob
+import os
+import csv
+import collections
+import subprocess
+import sys
+
+topN = int(sys.argv[1])
+
+pin_files = sorted(glob.glob('*.pin'))
+print(f"Processing {len(pin_files)} PIN files", flush=True)
+
+# Read header from first file
+with open(pin_files[0]) as f:
+    header = f.readline().strip().split('\t')
+
+# Find important column indices
+specId_idx = header.index('SpecId')
+hyperscore_idx = header.index('hyperscore') if 'hyperscore' in header else None
+log10_evalue_idx = header.index('log10_evalue') if 'log10_evalue' in header else None
+rank_idx = header.index('rank') if 'rank' in header else None
+
+# Determine score column for sorting (prefer hyperscore, fallback to log10_evalue)
+if hyperscore_idx is not None:
+    score_idx = hyperscore_idx
+    higher_is_better = True
+elif log10_evalue_idx is not None:
+    score_idx = log10_evalue_idx
+    higher_is_better = False
+else:
+    score_idx = None
+    higher_is_better = True
+    for i, col in enumerate(header):
+        if 'score' in col.lower() and i > 2:
+            score_idx = i
+            break
+
+print(f"Using column {header[score_idx] if score_idx else 'none'} for scoring", flush=True)
+
+# Group all PSMs by spectrum
+spectrum_psms = collections.defaultdict(list)
+total_psms = 0
+
+csv.field_size_limit(2**31 - 1)
+
+for pin_file in pin_files:
+    with open(pin_file) as f:
+        reader = csv.reader(f, delimiter='\t')
+        next(reader)
+        for row in reader:
+            if len(row) < len(header):
+                continue
+            spec_id = row[specId_idx]
+            if '_' in spec_id:
+                spec_key = spec_id.rsplit('_', 1)[0]
+            else:
+                spec_key = spec_id.rsplit('.', 1)[0]
+            
+            if score_idx is not None:
+                try:
+                    score = float(row[score_idx])
+                except (ValueError, IndexError):
+                    score = 0
+            else:
+                score = 0
+            
+            spectrum_psms[spec_key].append((score, row))
+            total_psms += 1
+    
+    print(f"  Read {pin_file}: {total_psms} total PSMs so far", flush=True)
+
+print(f"Total PSMs: {total_psms}", flush=True)
+print(f"Unique spectra: {len(spectrum_psms)}", flush=True)
+
+# Sort and keep top N
+kept_psms = 0
+
+with open('merged.pin', 'w') as out:
+    out.write('\t'.join(header) + '\n')
+    
+    for spec_key in sorted(spectrum_psms.keys()):
+        psms = spectrum_psms[spec_key]
+        psms.sort(key=lambda x: x[0], reverse=higher_is_better)
+        
+        for new_rank, (score, row) in enumerate(psms[:topN], 1):
+            if rank_idx is not None:
+                row[rank_idx] = str(new_rank)
+            row[specId_idx] = f"{spec_key}_{new_rank}"
+            out.write('\t'.join(row) + '\n')
+            kept_psms += 1
+
+print(f"Kept {kept_psms} PSMs ({100*kept_psms/max(1,total_psms):.1f}%)", flush=True)
+print(f"Merged PIN file size: {os.path.getsize('merged.pin') / 1e9:.2f} GB", flush=True)
+
+# Run Percolator
+print("Running Percolator...", flush=True)
+subprocess.run([
+    'percolator', '-j', 'merged.pin', '-X', 'perco.xml',
+    '-N', '500000', '--decoy-xml-output', '-y', '--subset-max-train', '300000'
+], check=True)
+print("Percolator complete", flush=True)
+PYEOF
+
+  python3 merge_and_run_perco.py ${topN}
   """
 }
 
