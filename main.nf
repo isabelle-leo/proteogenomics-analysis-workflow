@@ -601,7 +601,7 @@ print(f"Found {len(spectrum_psms)} unique spectra")
 total_written = 0
 outfile = f"{sample_name}.pin"
 with open(outfile, 'w') as out:
-    out.write('\t'.join(header) + '\n')
+    out.write('\\t'.join(header) + '\\n')
     for spec_key in sorted(spectrum_psms.keys()):
         psms = spectrum_psms[spec_key]
         psms.sort(key=lambda x: x[0], reverse=True)  # Sort by hyperscore desc
@@ -611,7 +611,7 @@ with open(outfile, 'w') as out:
         if rank_idx is not None:
             row[rank_idx] = '1'
         row[specId_idx] = f"{spec_key}_1"
-        out.write('\t'.join(row) + '\n')
+        out.write('\\t'.join(row) + '\\n')
         total_written += 1
 
 print(f"Wrote {total_written} PSMs (top hit per spectrum)")
@@ -878,7 +878,7 @@ print(f"Unique spectra: {len(spectrum_psms)}", flush=True)
 kept_psms = 0
 
 with open('merged.pin', 'w') as out:
-    out.write('\t'.join(header) + '\n')
+    out.write('\\t'.join(header) + '\\n')
     
     for spec_key in sorted(spectrum_psms.keys()):
         psms = spectrum_psms[spec_key]
@@ -888,7 +888,7 @@ with open('merged.pin', 'w') as out:
             if rank_idx is not None:
                 row[rank_idx] = str(new_rank)
             row[specId_idx] = f"{spec_key}_{new_rank}"
-            out.write('\t'.join(row) + '\n')
+            out.write('\\t'.join(row) + '\\n')
             kept_psms += 1
 
 print(f"Kept {kept_psms} PSMs ({100*kept_psms/max(1,total_psms):.1f}%)", flush=True)
