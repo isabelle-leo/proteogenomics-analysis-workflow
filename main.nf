@@ -44,8 +44,12 @@ if (!(search_engine in ['msgf', 'fragpipe'])) {
 // Database splits for FragPipe nonspecific search (default: 8)
 db_splits = params.db_splits ?: 8
 
-// Number of top PSMs to keep per spectrum (default: 1)
-output_report_topN = params.output_report_topN ?: 1
+// Number of top PSMs to keep per spectrum
+output_report_topN = params.output_report_topN ?: 3
+
+// Isobaric labeling (empty mapping if not specified)
+setisobaric = params.setisobaric ?: [:]
+setdenoms = params.setdenoms ?: [:]
 
 /* PIPELINE START */
 
