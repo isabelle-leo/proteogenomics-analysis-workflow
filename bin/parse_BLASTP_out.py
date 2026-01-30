@@ -108,7 +108,6 @@ for line in input3:
         output.write("\t".join(map(str,newrow))+"\n")
 
 
-input1.close()
 input2.close()
 input3.close()
 output.close()
